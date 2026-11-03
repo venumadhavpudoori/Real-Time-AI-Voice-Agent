@@ -248,10 +248,19 @@ class AgentService:
 
         # Step 4: Handle Availability & Booking Workflow
         slots = session.slots
-        has_booking_keywords = any(w in text_lower for w in ["book", "reserve", "table", "party", "reservation", "seats", "available", "tonight", "tomorrow", "friday", "saturday", "sunday", "dinner", "lunch"])
+        booking_keywords = [
+            "book", "reserve", "table", "party", "reservation", "seats", "seat",
+            "available", "availability", "tonight", "tomorrow", "friday", "saturday",
+            "sunday", "dinner", "lunch", "make that", "change to", "switch to",
+            "people", "guests", "patio", "outdoor", "indoor", "bar", "instead", "reschedule"
+        ]
+        has_booking_intent = (
+            any(w in text_lower for w in booking_keywords) or 
+            session.last_prompt in ("asking_name", "asking_phone", "asking_party_size", "asking_time")
+        )
 
         # If user is in the middle of answering booking questions OR expresses booking intent
-        if has_booking_keywords or session.last_prompt in ("asking_name", "asking_phone", "asking_party_size", "asking_time"):
+        if has_booking_intent:
             # Set default date and time if not yet chosen
             if not slots["date"]:
                 slots["date"] = str(date.today() + timedelta(days=1))
@@ -376,7 +385,7 @@ class AgentService:
             elif 1 <= len(cleaned_words) <= 3 and not any(char.isdigit() for char in text):
                 # User simply stated their name: "Alice", "John Smith"
                 candidate = " ".join(cleaned_words).title()
-                if candidate.lower() not in ["yes", "no", "sure", "cancel", "ok", "hello", "hi"]:
+                if candidate.lower() not in ["yes", "no", "sure", "cancel", "ok", "hello", "hi", "patio", "table", "book"]:
                     session.slots["customer_name"] = candidate
 
         # 2. If agent was waiting for phone number:
@@ -390,23 +399,32 @@ class AgentService:
                 session.slots["customer_phone"] = digits
 
         # 3. Party Size
-        party_match = re.search(r'\b(party of|table for|for|seats?)\s+(\d{1,2})\b', text_lower)
+        party_match = re.search(r'\b(?:make that|change to|party of|table for|for|seats?)\s+(\d{1,2})\b', text_lower)
         if party_match:
-            session.slots["party_size"] = int(party_match.group(2))
+            session.slots["party_size"] = int(party_match.group(1))
         else:
-            word_numbers = {
-                "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, 
-                "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10
-            }
-            for word, num in word_numbers.items():
-                if f"table for {word}" in text_lower or f"party of {word}" in text_lower or f"{word} people" in text_lower or f"{word} guests" in text_lower:
-                    session.slots["party_size"] = num
-                    break
-            # If agent specifically asked for party size and user just said a number
-            if session.last_prompt == "asking_party_size" and not session.slots["party_size"]:
-                num_match = re.search(r'\b(\d{1,2})\b', text)
-                if num_match:
-                    session.slots["party_size"] = int(num_match.group(1))
+            people_match = re.search(r'\b(\d{1,2})\s*(?:people|guests|persons|seats)\b', text_lower)
+            if people_match:
+                session.slots["party_size"] = int(people_match.group(1))
+            else:
+                word_numbers = {
+                    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, 
+                    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10
+                }
+                for word, num in word_numbers.items():
+                    if (f"table for {word}" in text_lower or 
+                        f"party of {word}" in text_lower or 
+                        f"{word} people" in text_lower or 
+                        f"{word} guests" in text_lower or
+                        f"make that {word}" in text_lower):
+                        session.slots["party_size"] = num
+                        break
+
+        # If agent specifically asked for party size and user just said a number
+        if session.last_prompt == "asking_party_size" and not session.slots["party_size"]:
+            num_match = re.search(r'\b(\d{1,2})\b', text)
+            if num_match:
+                session.slots["party_size"] = int(num_match.group(1))
 
         # 4. Date
         today = date.today()
@@ -415,27 +433,51 @@ class AgentService:
         elif "tomorrow" in text_lower:
             session.slots["date"] = str(today + timedelta(days=1))
         else:
-            date_match = re.search(r'\b(\d{4}-\d{2}-\d{2})\b', text)
-            if date_match:
-                session.slots["date"] = date_match.group(1)
+            days_of_week = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+            for idx, day_name in enumerate(days_of_week):
+                if day_name in text_lower:
+                    today_weekday = today.weekday()
+                    days_ahead = (idx - today_weekday) % 7
+                    if days_ahead == 0:
+                        days_ahead = 7
+                    session.slots["date"] = str(today + timedelta(days=days_ahead))
+                    break
+            if not session.slots["date"]:
+                date_match = re.search(r'\b(\d{4}-\d{2}-\d{2})\b', text)
+                if date_match:
+                    session.slots["date"] = date_match.group(1)
 
-        # 5. Time
-        time_match = re.search(r'\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b', text_lower)
-        if time_match:
-            hour = int(time_match.group(1))
-            minute = int(time_match.group(2) or 0)
-            meridiem = time_match.group(3)
-            # Only interpret as time if it has am/pm or is in a realistic hour range with time context
-            if meridiem:
-                if meridiem == "pm" and hour < 12:
+        # 5. Time (strict matching to avoid confusing party size numbers with hours)
+        time_colon = re.search(r'\b(\d{1,2}):(\d{2})\s*(am|pm)?\b', text_lower)
+        time_ampm = re.search(r'\b(\d{1,2})\s*(am|pm)\b', text_lower)
+        time_at = re.search(r'\b(?:at|around)\s+(\d{1,2})\b', text_lower)
+
+        if time_colon:
+            hour = int(time_colon.group(1))
+            minute = int(time_colon.group(2))
+            meridiem = time_colon.group(3)
+            if meridiem == "pm" and hour < 12:
+                hour += 12
+            elif meridiem == "am" and hour == 12:
+                hour = 0
+            elif not meridiem and hour < 11:
+                # Default dinner hour e.g. 7:30 -> 19:30
+                hour += 12
+            session.slots["time"] = f"{hour:02d}:{minute:02d}"
+        elif time_ampm:
+            hour = int(time_ampm.group(1))
+            meridiem = time_ampm.group(2)
+            if meridiem == "pm" and hour < 12:
+                hour += 12
+            elif meridiem == "am" and hour == 12:
+                hour = 0
+            session.slots["time"] = f"{hour:02d}:00"
+        elif time_at:
+            hour = int(time_at.group(1))
+            if 1 <= hour <= 12:
+                if hour < 11:
                     hour += 12
-                elif meridiem == "am" and hour == 12:
-                    hour = 0
-                session.slots["time"] = f"{hour:02d}:{minute:02d}"
-            elif "at" in text_lower or "around" in text_lower or ":" in text:
-                if 1 <= hour <= 12 and hour < 11:
-                    hour += 12  # default to evening dinner if not specified
-                session.slots["time"] = f"{hour:02d}:{minute:02d}"
+                session.slots["time"] = f"{hour:02d}:00"
 
         # 6. Dietary Requirements & Allergies
         allergy_keywords = ["peanut", "peanuts", "nut", "nuts", "gluten", "celiac", "dairy", "lactose", "shellfish", "vegan", "vegetarian", "halal", "kosher", "egg", "eggs", "soy", "fish"]
@@ -444,10 +486,14 @@ class AgentService:
             session.slots["dietary_requirements"] = ", ".join(found_allergens)
 
         # 7. Seating Area
-        if "patio" in text_lower or "outdoor" in text_lower:
+        if "patio" in text_lower or "outdoor" in text_lower or "outside" in text_lower or "terrace" in text_lower:
             session.slots["seating_area"] = "patio"
-        elif "bar" in text_lower:
+        elif "bar" in text_lower or "counter" in text_lower:
             session.slots["seating_area"] = "bar"
+        elif "private" in text_lower or "private room" in text_lower:
+            session.slots["seating_area"] = "private_room"
+        elif "indoor" in text_lower or "inside" in text_lower or "main room" in text_lower:
+            session.slots["seating_area"] = "indoor"
         elif "private" in text_lower:
             session.slots["seating_area"] = "private_room"
 

@@ -33,23 +33,27 @@ export function useVoiceAgent(sessionId = 'default-session') {
   const recognitionRef = useRef(null);
   const audioPlayerRef = useRef(null);
   const isAgentSpeakingRef = useRef(false);
+  const isMicActiveRef = useRef(false);
   const ignoreSpeechUntilRef = useRef(0);
 
-  // Sync state ref for event handlers
+  // Sync state refs for event listeners and callbacks
   useEffect(() => {
     isAgentSpeakingRef.current = agentState === AGENT_STATES.SPEAKING;
   }, [agentState]);
 
-  // Audio player element setup for server TTS
+  useEffect(() => {
+    isMicActiveRef.current = isMicActive;
+  }, [isMicActive]);
+
+  // Audio player setup for server TTS
   useEffect(() => {
     const audio = new Audio();
     audio.onended = () => {
-      // Small cooldown to prevent room speaker reverberation from triggering mic
-      ignoreSpeechUntilRef.current = Date.now() + 400;
-      setAgentState(AGENT_STATES.LISTENING);
+      ignoreSpeechUntilRef.current = Date.now() + 500;
+      setAgentState(isMicActiveRef.current ? AGENT_STATES.LISTENING : AGENT_STATES.IDLE);
     };
     audio.onerror = () => {
-      setAgentState(AGENT_STATES.LISTENING);
+      setAgentState(isMicActiveRef.current ? AGENT_STATES.LISTENING : AGENT_STATES.IDLE);
     };
     audioPlayerRef.current = audio;
     return () => {
@@ -90,14 +94,30 @@ export function useVoiceAgent(sessionId = 'default-session') {
     ]);
 
     setTimeout(() => {
-      setAgentState(AGENT_STATES.LISTENING);
+      setAgentState(isMicActiveRef.current ? AGENT_STATES.LISTENING : AGENT_STATES.IDLE);
     }, 300);
   }, [stopAllAudioPlayback]);
 
-  // Speak agent message using Web Speech Synthesis or Server MP3 base64
+  // Keyboard shortcut for Barge-in (Escape or Spacebar outside inputs)
+  useEffect(() => {
+    const handleKeyDown = (e) => {
+      const tag = e.target?.tagName?.toLowerCase();
+      const isInput = tag === 'input' || tag === 'textarea';
+      if (e.key === 'Escape' || (!isInput && e.key === ' ')) {
+        if (isAgentSpeakingRef.current) {
+          if (e.key === ' ') e.preventDefault();
+          interruptAgent();
+        }
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [interruptAgent]);
+
+  // Speak agent message using Web Speech Synthesis
   const speakWithBrowser = useCallback((text) => {
     if (!('speechSynthesis' in window)) {
-      setAgentState(AGENT_STATES.LISTENING);
+      setAgentState(isMicActiveRef.current ? AGENT_STATES.LISTENING : AGENT_STATES.IDLE);
       return;
     }
     window.speechSynthesis.cancel();
@@ -107,15 +127,18 @@ export function useVoiceAgent(sessionId = 'default-session') {
 
     // Pick clear English voice if available
     const voices = window.speechSynthesis.getVoices();
-    const preferredVoice = voices.find(v => v.lang.startsWith('en') && (v.name.includes('Natural') || v.name.includes('Google') || v.name.includes('Samantha') || v.name.includes('David')));
+    const preferredVoice = voices.find(v => 
+      v.lang.startsWith('en') && 
+      (v.name.includes('Natural') || v.name.includes('Google') || v.name.includes('Samantha') || v.name.includes('David') || v.name.includes('Jenny'))
+    );
     if (preferredVoice) utterance.voice = preferredVoice;
 
     utterance.onend = () => {
-      ignoreSpeechUntilRef.current = Date.now() + 400;
-      setAgentState(AGENT_STATES.LISTENING);
+      ignoreSpeechUntilRef.current = Date.now() + 500;
+      setAgentState(isMicActiveRef.current ? AGENT_STATES.LISTENING : AGENT_STATES.IDLE);
     };
     utterance.onerror = () => {
-      setAgentState(AGENT_STATES.LISTENING);
+      setAgentState(isMicActiveRef.current ? AGENT_STATES.LISTENING : AGENT_STATES.IDLE);
     };
 
     window.speechSynthesis.speak(utterance);
@@ -129,7 +152,7 @@ export function useVoiceAgent(sessionId = 'default-session') {
         const audio = audioPlayerRef.current;
         audio.src = `data:audio/mp3;base64,${audioBase64}`;
         audio.play().catch(err => {
-          console.warn('[Audio] Autoplay blocked, falling back to Web Speech API', err);
+          console.warn('[Audio] Server audio play failed, falling back to Web Speech API', err);
           speakWithBrowser(text);
         });
         return;
@@ -138,111 +161,128 @@ export function useVoiceAgent(sessionId = 'default-session') {
       }
     }
 
-    // Default: instantaneous local Web Speech API
+    // Default instantaneous local Web Speech API
     speakWithBrowser(text);
   }, [voiceEngine, speakWithBrowser]);
 
-  // 2. Setup WebSocket Connection
+  // 2. Setup WebSocket Connection with Auto-Reconnect
   useEffect(() => {
+    let reconnectTimeout = null;
+    let isUnmounted = false;
+
+    // Direct connect to backend port 8000 on localhost to prevent proxy disconnects
+    const isLocalhost = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
+    const wsHost = isLocalhost ? '127.0.0.1:8000' : window.location.host;
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${protocol}//${window.location.host}/ws/voice-agent?session_id=${sessionId}`;
-    const ws = new WebSocket(wsUrl);
-    socketRef.current = ws;
+    const wsUrl = `${protocol}//${wsHost}/ws/voice-agent?session_id=${sessionId}`;
 
-    ws.onopen = () => {
-      console.log('[WebSocket] Connected');
-      setWsConnected(true);
-    };
+    function connect() {
+      if (isUnmounted) return;
+      console.log('[WebSocket] Connecting to', wsUrl);
+      const ws = new WebSocket(wsUrl);
+      socketRef.current = ws;
 
-    ws.onclose = () => {
-      console.log('[WebSocket] Disconnected');
-      setWsConnected(false);
-    };
+      ws.onopen = () => {
+        console.log('[WebSocket] Connected successfully');
+        setWsConnected(true);
+      };
 
-    ws.onerror = (err) => {
-      console.error('[WebSocket] Error:', err);
-      setWsConnected(false);
-    };
-
-    ws.onmessage = (event) => {
-      try {
-        const data = JSON.parse(event.data);
-        const { type, state, text, audio_base64, tool_name, tool_args, tool_result, guardrail_info } = data;
-
-        if (state) {
-          setAgentState(state);
+      ws.onclose = () => {
+        console.log('[WebSocket] Disconnected. Reconnecting in 2s...');
+        setWsConnected(false);
+        if (!isUnmounted) {
+          reconnectTimeout = setTimeout(connect, 2000);
         }
+      };
 
-        if (type === 'agent_response' && text) {
-          setMessages(prev => [
-            ...prev,
-            {
-              id: `msg-${Date.now()}-${Math.random()}`,
-              sender: 'agent',
-              text,
-              timestamp: new Date().toLocaleTimeString(),
-              type: 'agent_response'
-            }
-          ]);
-          playAgentResponse(text, audio_base64);
-        } else if (type === 'tool_start') {
-          setActiveTool({ name: tool_name, args: tool_args, status: 'running' });
-          setMessages(prev => [
-            ...prev,
-            {
-              id: `tool-${Date.now()}`,
-              sender: 'system',
-              text: `Executing tool: ${tool_name}`,
-              tool: { name: tool_name, args: tool_args, status: 'running' },
-              timestamp: new Date().toLocaleTimeString(),
-              type: 'tool_start'
-            }
-          ]);
-        } else if (type === 'tool_result') {
-          setActiveTool(prev => prev ? { ...prev, result: tool_result, status: 'completed' } : null);
-          setMessages(prev => [
-            ...prev,
-            {
-              id: `tool-res-${Date.now()}`,
-              sender: 'system',
-              text: `Tool completed: ${tool_name}`,
-              tool: { name: tool_name, result: tool_result, status: 'completed' },
-              timestamp: new Date().toLocaleTimeString(),
-              type: 'tool_result'
-            }
-          ]);
-          // Broadcast database mutation so other UI components refresh in real-time
-          window.dispatchEvent(new CustomEvent('database-updated', { detail: { tool_name, tool_result } }));
-        } else if (type === 'guardrail_triggered') {
-          setLatestGuardrail(guardrail_info);
-          window.dispatchEvent(new CustomEvent('guardrail-updated', { detail: guardrail_info }));
-          setMessages(prev => [
-            ...prev,
-            {
-              id: `guard-${Date.now()}`,
-              sender: 'guardrail',
-              text: text || `Guardrail: ${guardrail_info?.type}`,
-              guardrail: guardrail_info,
-              timestamp: new Date().toLocaleTimeString(),
-              type: 'guardrail'
-            }
-          ]);
+      ws.onerror = (err) => {
+        console.warn('[WebSocket] Socket encountered error:', err);
+      };
+
+      ws.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          const { type, state, text, audio_base64, tool_name, tool_args, tool_result, guardrail_info } = data;
+
+          if (state) {
+            setAgentState(state);
+          }
+
+          if (type === 'agent_response' && text) {
+            setMessages(prev => [
+              ...prev,
+              {
+                id: `msg-${Date.now()}-${Math.random()}`,
+                sender: 'agent',
+                text,
+                timestamp: new Date().toLocaleTimeString(),
+                type: 'agent_response'
+              }
+            ]);
+            playAgentResponse(text, audio_base64);
+          } else if (type === 'tool_start') {
+            setActiveTool({ name: tool_name, args: tool_args, status: 'running' });
+            setMessages(prev => [
+              ...prev,
+              {
+                id: `tool-${Date.now()}`,
+                sender: 'system',
+                text: `Executing tool: ${tool_name}`,
+                tool: { name: tool_name, args: tool_args, status: 'running' },
+                timestamp: new Date().toLocaleTimeString(),
+                type: 'tool_start'
+              }
+            ]);
+          } else if (type === 'tool_result') {
+            setActiveTool(prev => prev ? { ...prev, result: tool_result, status: 'completed' } : null);
+            setMessages(prev => [
+              ...prev,
+              {
+                id: `tool-res-${Date.now()}`,
+                sender: 'system',
+                text: `Tool completed: ${tool_name}`,
+                tool: { name: tool_name, result: tool_result, status: 'completed' },
+                timestamp: new Date().toLocaleTimeString(),
+                type: 'tool_result'
+              }
+            ]);
+            // Broadcast database mutation so other UI components refresh in real-time
+            window.dispatchEvent(new CustomEvent('database-updated', { detail: { tool_name, tool_result } }));
+          } else if (type === 'guardrail_triggered') {
+            setLatestGuardrail(guardrail_info);
+            window.dispatchEvent(new CustomEvent('guardrail-updated', { detail: guardrail_info }));
+            setMessages(prev => [
+              ...prev,
+              {
+                id: `guard-${Date.now()}`,
+                sender: 'guardrail',
+                text: text || `Guardrail: ${guardrail_info?.type}`,
+                guardrail: guardrail_info,
+                timestamp: new Date().toLocaleTimeString(),
+                type: 'guardrail'
+              }
+            ]);
+          }
+        } catch (err) {
+          console.error('[WebSocket] Parse error:', err);
         }
-      } catch (err) {
-        console.error('[WebSocket] Parse error:', err);
-      }
-    };
+      };
+    }
+
+    connect();
 
     // Keepalive ping
     const pingInterval = setInterval(() => {
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ type: 'ping' }));
+      if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
+        socketRef.current.send(JSON.stringify({ type: 'ping' }));
       }
-    }, 25000);
+    }, 20000);
 
     return () => {
+      isUnmounted = true;
       clearInterval(pingInterval);
-      ws.close();
+      if (reconnectTimeout) clearTimeout(reconnectTimeout);
+      if (socketRef.current) socketRef.current.close();
     };
   }, [sessionId, playAgentResponse]);
 
@@ -260,7 +300,7 @@ export function useVoiceAgent(sessionId = 'default-session') {
     recognition.lang = 'en-US';
 
     recognition.onresult = (event) => {
-      // 1. Check if we should ignore audio echo (e.g. while agent is speaking or in post-speak cooldown)
+      // Ignore audio echo while agent is speaking or in post-speak cooldown
       if (isAgentSpeakingRef.current || Date.now() < ignoreSpeechUntilRef.current) {
         return;
       }
@@ -309,7 +349,7 @@ export function useVoiceAgent(sessionId = 'default-session') {
 
     recognition.onerror = (err) => {
       console.warn('[SpeechRecognition] Error:', err.error);
-      if (err.error === 'not-allowed') {
+      if (err.error === 'not-allowed' || err.error === 'service-not-allowed') {
         setIsMicActive(false);
       }
     };
@@ -341,7 +381,7 @@ export function useVoiceAgent(sessionId = 'default-session') {
   const toggleMicrophone = useCallback(() => {
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
     if (!SpeechRecognition) {
-      alert('Speech Recognition is not supported on this browser (Chrome or Edge recommended). You can still type in transcripts!');
+      alert('Speech Recognition is not supported on this browser (Chrome or Edge recommended). You can still type in voice queries!');
       return;
     }
 
@@ -364,7 +404,7 @@ export function useVoiceAgent(sessionId = 'default-session') {
     }
   }, [isMicActive]);
 
-  // Send typed text message (manual text input support)
+  // Send typed text message (manual text input or quick voice prompts)
   const sendTextMessage = useCallback((text) => {
     if (!text || !text.trim()) return;
     const clean = text.trim();
@@ -389,6 +429,8 @@ export function useVoiceAgent(sessionId = 'default-session') {
         type: 'user_transcript',
         text: clean
       }));
+    } else {
+      console.warn('[WebSocket] Cannot send message, socket not open. ReadyState:', socketRef.current?.readyState);
     }
   }, [interruptAgent]);
 

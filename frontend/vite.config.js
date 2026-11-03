@@ -7,14 +7,25 @@ export default defineConfig({
     port: 5173,
     proxy: {
       '/api': {
-        target: 'http://localhost:8000',
+        target: 'http://127.0.0.1:8000',
+        changeOrigin: true
+      },
+      '/health': {
+        target: 'http://127.0.0.1:8000',
         changeOrigin: true
       },
       '/ws': {
-        target: 'ws://localhost:8000',
-        ws: true
+        target: 'ws://127.0.0.1:8000',
+        ws: true,
+        changeOrigin: true,
+        configure: (proxy) => {
+          proxy.on('error', (err) => {
+            if (err.code !== 'ECONNRESET' && err.code !== 'ECONNABORTED') {
+              console.warn('[vite-ws-proxy]', err.message);
+            }
+          });
+        }
       }
     }
   }
 });
-
